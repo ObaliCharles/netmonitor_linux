@@ -1,65 +1,77 @@
 #!/usr/bin/env python3
 """
-monitor.py — the collector daemon.
+monitor.py — the collector. Must run as root (NetHogs needs raw socket access).
 
-Runs `nethogs -t <interface>` as a subprocess, reads its streaming output,
-groups lines into refresh batches, and writes each batch to SQLite as a
-set of samples.
-
-Must be run as root (NetHogs needs raw socket access to attribute traffic
-to processes). Typically launched via the systemd unit in netmonitor.service,
-but you can also just run it directly with sudo for testing:
+Normally launched by gui.py via `pkexec`, which shows a graphical password
+prompt. Can also be run directly for testing:
 
     sudo python3 monitor.py --interface wlp3s0
 
-Run `ip link` if you're not sure of your interface name (common ones:
-wlp3s0 / wlan0 for Wi-Fi, enp0s3 / eth0 for Ethernet).
+Writes its own PID to ~/.local/share/netmonitor/monitor.pid on start and
+removes it on clean exit, so the GUI can tell whether monitoring is active
+and can stop it later.
 """
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import db
 from nethogs_parser import parse_batch
 
+PID_FILE = Path.home() / ".local" / "share" / "netmonitor" / "monitor.pid"
+# Note: when launched via pkexec, Path.home() resolves to root's home unless
+# SUDO_USER/PKEXEC env vars are used to redirect it back to the real user.
+# We handle that below in resolve_real_home().
+
+
+def resolve_real_home() -> Path:
+    """
+    pkexec runs us as root, so Path.home() would normally give /root — but we
+    want the PID file and the database in the *actual user's* home directory
+    so the unprivileged GUI (running as that user) can read them.
+    """
+    user = os.environ.get("PKEXEC_UID")
+    if user:
+        import pwd
+        return Path(pwd.getpwuid(int(user)).pw_dir)
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        import pwd
+        return Path(pwd.getpwnam(sudo_user).pw_dir)
+    return Path.home()
+
 
 def check_nethogs_installed():
     if shutil.which("nethogs") is None:
-        sys.exit(
-            "nethogs is not installed. Install it with:\n"
-            "  sudo apt install nethogs"
-        )
+        sys.exit("nethogs is not installed. Install it with:\n  sudo apt install nethogs")
 
 
-def stream_nethogs(interface: str | None):
-    """
-    Launch `nethogs -t` and yield it line by line. If `interface` is given,
-    NetHogs is restricted to that device; otherwise it watches all devices
-    it can find.
-    """
-    cmd = ["nethogs", "-t"]
-    if interface:
-        cmd.append(interface)
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
-    return proc
+def write_pid_file(real_home: Path):
+    pid_file = real_home / ".local" / "share" / "netmonitor" / "monitor.pid"
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.write_text(str(os.getpid()))
+    return pid_file
 
 
 def run(interface: str | None, verbose: bool):
     check_nethogs_installed()
-    proc = stream_nethogs(interface)
+    real_home = resolve_real_home()
+
+    # Make sure db.py writes to the real user's home, not root's.
+    db.DB_PATH = real_home / ".local" / "share" / "netmonitor" / "netmonitor.db"
+
+    pid_file = write_pid_file(real_home)
+
+    cmd = ["nethogs", "-t"] + ([interface] if interface else [])
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
 
     batch_lines: list[str] = []
     written = 0
-
     try:
         with db.connect() as conn:
             db.set_meta(conn, "monitoring_started_hint", str(int(time.time())))
@@ -72,17 +84,10 @@ def run(interface: str | None, verbose: bool):
                     if samples:
                         with db.connect() as conn:
                             for s in samples:
-                                db.insert_sample(
-                                    conn,
-                                    process=s.process,
-                                    interface=interface,
-                                    down_bytes=s.down_bytes,
-                                    up_bytes=s.up_bytes,
-                                )
+                                db.insert_sample(conn, s.process, interface, s.down_bytes, s.up_bytes)
                         written += len(samples)
                         if verbose:
-                            print(f"[{time.strftime('%H:%M:%S')}] wrote {len(samples)} samples "
-                                  f"(total written: {written})")
+                            print(f"[{time.strftime('%H:%M:%S')}] wrote {len(samples)} samples (total: {written})")
                 batch_lines = []
             else:
                 batch_lines.append(line)
@@ -94,17 +99,18 @@ def run(interface: str | None, verbose: bool):
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
+        if pid_file.exists():
+            pid_file.unlink()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Collect per-process bandwidth usage via NetHogs into SQLite.")
-    ap.add_argument("--interface", "-i", default=None,
-                     help="Network interface to monitor (e.g. wlp3s0). Default: all interfaces NetHogs finds.")
-    ap.add_argument("--verbose", "-v", action="store_true", help="Print each batch as it's written.")
+    ap = argparse.ArgumentParser(description="Collect per-process bandwidth via NetHogs into SQLite.")
+    ap.add_argument("--interface", "-i", default=None)
+    ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
 
-    if __import__("os").geteuid() != 0:
-        sys.exit("monitor.py must be run as root (NetHogs needs raw socket access). Try: sudo python3 monitor.py")
+    if os.geteuid() != 0:
+        sys.exit("monitor.py must run as root. Try: sudo python3 monitor.py")
 
     run(args.interface, args.verbose)
 
