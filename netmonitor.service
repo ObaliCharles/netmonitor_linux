@@ -1,0 +1,15 @@
+[Unit]
+Description=Network Data Monitor (per-process bandwidth collector)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Edit the interface below to match your machine (check with: ip link)
+ExecStart=/usr/bin/python3 /opt/netmonitor/monitor.py --interface wlp3s0
+Restart=on-failure
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
